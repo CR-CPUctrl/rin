@@ -1,0 +1,91 @@
+name: bilibili-live-notify
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 每5分钟检查一次
+  workflow_dispatch:          # 允许在 Actions 页面手动点一次(用来测试)
+
+permissions:
+  contents: write             # 允许把状态文件回写到仓库,防止重复轰炸
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查开播状态,变化时通过 Server酱 推送微信
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, urllib.parse
+
+          # ====== 要监控的直播间号,改成你自己的(live.bilibili.com/ 后面那串)======
+          ROOMS = ["1752663943","1905050770"]
+
+          sendkey = os.environ.get("SENDKEY", "")
+          UA = {"User-Agent": "Mozilla/5.0"}
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers=UA)
+              return json.load(urllib.request.urlopen(req, timeout=20))
+
+          def push(title, desp):
+              data = urllib.parse.urlencode({"title": title, "desp": desp}).encode()
+              req = urllib.request.Request("https://sctapi.ftqq.com/%s.send" % sendkey, data=data)
+              return json.load(urllib.request.urlopen(req, timeout=20))
+
+          # state.json 记录上次状态:只有从"没开播"变成"开播"那一刻才提醒一次
+          try:
+              state = json.load(open("state.json", encoding="utf-8"))
+          except Exception:
+              state = {}
+
+          # 1) 房间号 -> uid + 直播状态
+          rooms = {}
+          for rid in ROOMS:
+              try:
+                  d = get_json("https://api.live.bilibili.com/room/v1/Room/get_info?room_id=" + rid)["data"]
+                  rooms[str(d["uid"])] = {"room_id": rid, "status": str(d.get("live_status")), "title": d.get("title", "")}
+              except Exception as e:
+                  print("room %s error: %s" % (rid, e))
+
+          # 2) 按uid批量拿主播名字
+          if rooms:
+              qs = urllib.parse.urlencode([("uids[]", u) for u in rooms])
+              d = get_json("https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids?" + qs)["data"]
+              for uid, info in d.items():
+                  if uid in rooms:
+                      rooms[uid]["uname"] = info.get("uname", uid)
+
+          for uid, r in rooms.items():
+              prev = state.get(r["room_id"], "0")
+              now = r["status"]
+              state[r["room_id"]] = now
+              name = r.get("uname", r["room_id"])
+              link = "https://live.bilibili.com/%s" % r["room_id"]
+              if prev != "1" and now == "1":                       # 刚开播
+                  if sendkey:
+                      res = push("【开播】%s 正在直播" % name,
+                                 "**%s**\n\n[点我进入直播间](%s)" % (r["title"] or name, link))
+                      print("pushed:", res.get("code"), res.get("message"))
+                  else:
+                      print("SENDKEY 未配置,跳过推送")
+              # 想要下播也提醒,把下面三行的注释号去掉:
+              # if prev == "1" and now != "1":
+              #     res = push("【下播】%s" % name, "[%s](%s) 下播了" % (r["title"] or name, link))
+              #     print("pushed:", res.get("code"), res.get("message"))
+
+          json.dump(state, open("state.json", "w", encoding="utf-8"), ensure_ascii=False)
+          PYEOF
+
+      - name: 状态有变化时把 state.json 提交回仓库
+        run: |
+          if git status --porcelain | grep -q state.json; then
+            git config user.name  "live-bot"
+            git config user.email "actions@github.com"
+            git add state.json
+            git commit -m "update state [skip ci]"
+            git push
+          fi
